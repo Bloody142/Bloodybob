@@ -7,16 +7,16 @@ ARCH=arm64
 
 xmake clean
 # Build the arm64 version
-xmake f -y -p macosx -a "arm64" -m $CONFIG --target_minver=13.5
+xmake f -y -p macosx -a "arm64" -m $CONFIG --target_minver=14.6
 xmake
 
 # Build the x86_64 version
-xmake f -y -p macosx -a "x86_64" -m $CONFIG --target_minver=13.5
+xmake f -y -p macosx -a "x86_64" -m $CONFIG --target_minver=14.6
 xmake
 
 # Rebuild the package app bundle after switching architectures so xcode.xcassets
 # regenerates Assets.car even when xmake clean leaves stale asset dependencies.
-xmake f -y -p macosx -a "$ARCH" -m "$CONFIG" --target_minver=15.4
+xmake f -y -p macosx -a "$ARCH" -m "$CONFIG" --target_minver=14.6
 xmake -r -y macOSLauncher
 test -f "build/macosx/$ARCH/$CONFIG/macOSLauncher.app/Contents/Resources/Assets.car"
 
@@ -38,6 +38,7 @@ test -f "build/macosx/$ARCH/$CONFIG/STFC Community Mod.app/Contents/Resources/As
 codesign --force --verify --verbose --deep --sign "-" build/macosx/$ARCH/$CONFIG/STFC\ Community\ Mod.app
 
 DMG_SOURCE="build/macosx/$ARCH/$CONFIG/dmg-source"
+rm -rf "$DMG_SOURCE"
 mkdir "$DMG_SOURCE"
 mv "build/macosx/$ARCH/$CONFIG/STFC Community Mod.app" "$DMG_SOURCE/"
 
