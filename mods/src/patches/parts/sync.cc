@@ -3,12 +3,15 @@
 #include "file.h"
 #include "str_utils.h"
 
+#include <Digit.Platform.Models.pb.h>
+#include <Digit.PrimePlatform.Content.pb.h>
 #include <Digit.PrimeServer.Models.pb.h>
 #include <il2cpp-api-types.h>
 #include <il2cpp/il2cpp_helper.h>
 #include <prime/EntityGroup.h>
 #include <prime/RealtimeDataPayload.h>
 #include <prime/ServiceResponse.h>
+#include <prime/UserProfileManager.h>
 #include <spud/detour.h>
 
 #include <spdlog/spdlog.h>
@@ -30,17 +33,22 @@
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <mutex>
 #include <queue>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -612,6 +620,23 @@ namespace types
     std::vector<int64_t> components;
   };
 
+  struct PlanetaryBaseState {
+    explicit PlanetaryBaseState(const int32_t l = -1, const int32_t s = -1, const int64_t p = -1)
+        : level(l)
+        , status(s)
+        , position(p)
+    {
+    }
+
+    bool operator==(const PlanetaryBaseState& other) const
+    { return this->level == other.level && this->status == other.status && this->position == other.position; }
+
+  private:
+    int32_t level    = -1;
+    int32_t status   = -1;
+    int64_t position = -1;
+  };
+
   struct pairhash {
     template <typename T, typename U> std::size_t operator()(const std::pair<T, U>& x) const
     { return std::hash<T>()(x.first) ^ std::hash<U>()(x.second); }
@@ -799,8 +824,11 @@ static std::mutex                           slot_states_mtx;
 static std::unordered_map<int64_t, size_t> away_assignment_states;
 static std::mutex                          away_assignment_states_mtx;
 
-static std::unordered_map<int64_t, int64_t> structure_states;
-static std::mutex                           structure_states_mtx;
+static std::unordered_map<int64_t, types::PlanetaryBaseState> structure_states;
+static std::mutex                                             structure_states_mtx;
+
+static std::unordered_map<int64_t, int64_t> pieces_states;
+static std::mutex                           pieces_states_mtx;
 
 static eastl::ring_buffer<uint64_t> previously_sent_battlelogs;
 static std::mutex                   previously_sent_battlelogs_mtx;
@@ -1119,6 +1147,21 @@ static void away_assignment_event(const Digit::PrimeServer::Models::AwayAssignme
     }
   }
 
+  auto officer_traits = json::array();
+  for (const auto& trait : instance.officertraits()) {
+    officer_traits.push_back({{"tid", trait.traitid()}, {"max_level", trait.maxlevel()}});
+  }
+
+  // Same ordering concern as officer_ids: sort by trait id so the array and the de-dup hash are stable.
+  std::vector<std::pair<int64_t, int32_t>> critical_trait_pairs(instance.parameters().criticaltraitscores().begin(),
+                                                                instance.parameters().criticaltraitscores().end());
+  std::ranges::sort(critical_trait_pairs, {}, &std::pair<int64_t, int32_t>::first);
+
+  auto critical_trait_scores = json::array();
+  for (const auto& [tid, score] : critical_trait_pairs) {
+    critical_trait_scores.push_back({{"tid", tid}, {"score", score}});
+  }
+
   json event = {{"type", SyncConfig::Type::AwayAssignments},
                 {"aid", instance.id()},
                 {"template_id", instance.awayassignmenttemplateid()},
@@ -1126,7 +1169,17 @@ static void away_assignment_event(const Digit::PrimeServer::Models::AwayAssignme
                 {"officer_ids", officer_ids},
                 {"job_uuid", instance.jobuuid()},
                 {"duration", instance.parameters().duration()},
-                {"rarity", instance.rarity()}};
+                {"rarity", instance.rarity()},
+                {"officer_traits", officer_traits},
+                {"critical_trait_scores", critical_trait_scores},
+                {"success_chance", instance.parameters().successchance()},
+                {"critical_success_chance", instance.parameters().criticalsuccesschance()},
+                {"max_critical_success_chance", instance.maxcriticalsuccesschance()},
+                {"key_stat", instance.keystat()},
+                {"max_assignable_officers", instance.maxassignableofficerscount()},
+                {"attack_weight", instance.attackweight()},
+                {"defense_weight", instance.defenseweight()},
+                {"health_weight", instance.healthweight()}};
 
   const auto state_value = std::hash<json>{}(event);
 
@@ -1442,29 +1495,25 @@ static void starbase_modules(std::unique_ptr<std::string>&& bytes)
 static void planetary_base_data(std::unique_ptr<std::string>&& bytes)
 {
   using json = nlohmann::json;
-  using trackers::structure_states;
-  using trackers::structure_states_mtx;
+  using trackers::pieces_states;
+  using trackers::pieces_states_mtx;
 
   if (auto response = Digit::PrimeServer::Models::PlanetaryBase(); response.ParseFromString(*bytes)) {
-    http::logging::trace("PROCESS", "planetary base data", STR_FORMAT("Processing {} buildings", response.buildings_size()));
-
-    auto structure_array = json::array();
+    http::logging::trace("PROCESS", "planetary base data", STR_FORMAT("Processing {} haven building pieces", response.pieces_size()));
+    auto pieces_array = json::array();
     {
-      std::scoped_lock lk(structure_states_mtx);
+      std::scoped_lock lk(pieces_states_mtx);
 
-      for (const auto& building : response.buildings() | std::views::values) {
-        if (const auto& it = structure_states.find(building.id()); it == structure_states.end() || it->second != building.level()) {
-          structure_states[building.id()] = building.level();
-          structure_array.push_back({{"type", SyncConfig::Type::Haven},
-                                     {"sid", building.specid()},
-                                     {"id", building.id()},
-                                     {"level", building.level()}});
+      for (const auto& [piece, count] : response.pieces()) {
+        if (const auto& it = pieces_states.find(piece); it == pieces_states.end() || it->second != count) {
+          pieces_states[piece] = count;
+          pieces_array.push_back({{"type", SyncConfig::Type::Haven + "_pieces"}, {"sid", piece}, {"count", count}});
         }
       }
     }
 
-    if (!structure_array.empty()) {
-      workers::queue_data(SyncConfig::Type::Haven, structure_array);
+    if (!pieces_array.empty()) {
+      workers::queue_data(SyncConfig::Type::Haven, pieces_array);
     }
   }
 }
@@ -1473,9 +1522,22 @@ static void planetary_map_building_data(const google::protobuf::Map<int64_t, Dig
 {
   // TODO: use PlanetaryMapBuildingDiff for updates during game session
 
+  using trackers::structure_states;
+  using trackers::structure_states_mtx;
+  using trackers::types::PlanetaryBaseState;
+
   auto structure_array = nlohmann::json::array();
-  for (const auto& building : buildings | std::views::values) {
-    structure_array.push_back({{"type", SyncConfig::Type::Haven + "_map"}, {"sid", building.specid()}, {"level", building.level()}, {"status", building.status()}, {"position", building.position()}});
+  {
+    std::scoped_lock lk(structure_states_mtx);
+
+    for (const auto& [id, building] : buildings) {
+      const PlanetaryBaseState state{building.level(), building.status(), building.position()};
+
+      if (const auto& it = structure_states.find(id); it == structure_states.end() || it->second != state) {
+        structure_states[id] = state;
+        structure_array.push_back({{"type", SyncConfig::Type::Haven}, {"sid", building.specid()}, {"id", id}, {"level", building.level()}, {"status", building.status()}, {"position", building.position()}});
+      }
+    }
   }
 
   if (!structure_array.empty()) {
@@ -1501,18 +1563,118 @@ static void planetary_map_prosperity(std::unique_ptr<std::string>&& bytes)
   }
 }
 
-/* static void planetary_map(std::unique_ptr<std::string>&& bytes)
+// The game's record of the local player, or nullptr. Calls into IL2CPP: game thread only.
+static UserProfile* local_user_profile()
+{
+  auto* const manager = UserProfileManager::Instance();
+  if (manager == nullptr) {
+    return nullptr;
+  }
+
+  static auto fn = UserProfileManager::get_class_helper().GetMethodInfo("GetLocalUserProfile");
+  if (fn == nullptr) {
+    return nullptr;
+  }
+
+  Il2CppException* exception = nullptr;
+  auto* const      profile   = reinterpret_cast<UserProfile*>(il2cpp_runtime_invoke(fn, manager, nullptr, &exception));
+  return exception == nullptr ? profile : nullptr;
+}
+
+static void planetary_map(std::unique_ptr<std::string>&& bytes)
 {
   if (auto response = Digit::PrimeServer::Models::PlanetaryMapResponse(); response.ParseFromString(*bytes)) {
     http::logging::trace("PROCESS", "planetary map", STR_FORMAT("Processing {} haven structures", response.mapdata().buildings_size()));
-    const auto& owner = response.owneruserid();
 
-    // TODO: If the owner is not the current player, we may want to skip processing the map data, as it may not be relevant to the player's own structures.
+    const auto& owner = response.owneruserid();
+    if (!owner.empty()) {
+      auto localProfile = local_user_profile();
+      if (localProfile == nullptr) {
+        spdlog::error("Failed to get local user profile");
+        return;
+      }
+
+      const auto userId = localProfile->UserId;
+      if (userId == nullptr) {
+        spdlog::error("Local user profile has empty UserId");
+        return;
+      }
+
+      if (owner != userId) {
+        spdlog::debug("Planetary map data is not for local user, skipping processing");
+        return;
+      }
+    }
+
     planetary_map_building_data(response.mapdata().buildings());
   } else {
     spdlog::error("Failed to parse planetary map");
   }
-} */
+}
+
+// The local player's user id, or "" if the profile is not available. Game thread only.
+static std::string local_user_id(UserProfile* profile)
+{
+  if (profile == nullptr) {
+    return {};
+  }
+
+  const auto* const user_id = profile->UserId;
+  return user_id == nullptr ? std::string{} : to_string(user_id);
+}
+
+// Sends the local player's own profile; `self` and `level` come from the game thread. Only the record whose user id
+// is `self` is read. The server record carries level 0, so the in-memory Level is used: it lags one own-record
+// response after a level-up.
+static void own_profile(std::unique_ptr<std::string>&& bytes, const std::string& self, int32_t level)
+{
+  using json = nlohmann::json;
+
+  static std::tuple<int32_t, uint64_t, bool> last_sent;
+  static bool                                has_sent = false;
+  static std::mutex                          last_sent_mtx;
+
+  auto response = Digit::PrimeServer::Models::UserProfilesResponse();
+  if (!response.ParseFromString(*bytes)) {
+    spdlog::error("Failed to parse own user profile");
+    return;
+  }
+
+  const Digit::PrimeServer::Models::UserProfile* own = nullptr;
+  for (const auto& profile : response.userprofiles()) {
+    if (profile.userid() == self) {
+      own = &profile;
+      break;
+    }
+  }
+
+  if (own == nullptr) {
+    return;
+  }
+
+  // XP rides along but is not part of the key: an XP-only change waits for the next keyed change.
+  const auto key = std::make_tuple(level, own->militarymight(), own->planetarybaseunlocked());
+  bool       first_sync;
+  {
+    std::scoped_lock lk(last_sent_mtx);
+    first_sync = !has_sent;
+    if (!first_sync && last_sent == key) {
+      return;
+    }
+    last_sent = key;
+    has_sent  = true;
+  }
+
+  auto profile_array = json::array();
+  profile_array.push_back({{"type", SyncConfig::Type::Profile},
+                           {"uid", self},
+                           {"level", level},
+                           {"xp", own->xp()},
+                           {"military_might", own->militarymight()},
+                           {"planetary_base_unlocked", own->planetarybaseunlocked()}});
+
+  workers::queue_data(SyncConfig::Type::Profile, profile_array, first_sync);
+}
 
 static void player_inventories(std::unique_ptr<std::string>&& bytes)
 {
@@ -1564,9 +1726,10 @@ static void player_inventories(std::unique_ptr<std::string>&& bytes)
 static void jobs(std::unique_ptr<std::string>&& bytes)
 {
   using json = nlohmann::json;
-  static std::unordered_set<std::string> jobs_active;
-  static std::mutex                      jobs_active_mtx;
-  static std::atomic_bool                is_first_sync{true};
+  using job_state = std::tuple<int64_t, int64_t, int64_t>;
+  static std::unordered_map<std::string, job_state> jobs_active;
+  static std::mutex                                 jobs_active_mtx;
+  static std::atomic_bool                           is_first_sync{true};
 
   if (auto response = Digit::PrimeServer::Models::JobResponse(); response.ParseFromString(*bytes)) {
 
@@ -1580,10 +1743,14 @@ static void jobs(std::unique_ptr<std::string>&& bytes)
       const std::string& uuid = job.uuid();
       uuids_in_response.insert(uuid);
 
+      const job_state state{job.starttime().seconds(), job.duration(), job.reductioninseconds()};
+
       bool emit = false;
       {
         std::scoped_lock lk(jobs_active_mtx);
-        emit = jobs_active.insert(uuid).second;
+        const auto [it, inserted] = jobs_active.try_emplace(uuid, state);
+        emit                      = inserted || it->second != state;
+        it->second                = state;
       }
 
       if (!emit) {
@@ -1632,8 +1799,8 @@ static void jobs(std::unique_ptr<std::string>&& bytes)
     {
       std::scoped_lock lk(jobs_active_mtx);
       for (auto it = jobs_active.begin(); it != jobs_active.end();) {
-        if (!uuids_in_response.contains(*it)) {
-          job_array.push_back({{"type", "completed_" + SyncConfig::Type::Jobs}, {"uuid", *it}});
+        if (!uuids_in_response.contains(it->first)) {
+          job_array.push_back({{"type", "completed_" + SyncConfig::Type::Jobs}, {"uuid", it->first}});
           it = jobs_active.erase(it);
         } else {
           ++it;
@@ -2134,6 +2301,115 @@ static void active_officer_traits(std::unique_ptr<std::string>&& bytes)
   }
 }
 
+// Store offers arrive in Platform responses. Prices are in Resource.amount; amountUlong is the fallback.
+static int64_t store_offer_amount(const Digit::PrimePlatform::Content::Resource& resource)
+{ return static_cast<int64_t>(resource.amount() != 0 ? resource.amount() : resource.amountulong()); }
+
+// Platform ids are strings; emit numeric ids as numbers like the rest of the sync data.
+static nlohmann::json store_offer_id(const std::string& id)
+{
+  int64_t     value = 0;
+  const auto* end   = id.data() + id.size();
+  if (const auto [ptr, ec] = std::from_chars(id.data(), end, value); !id.empty() && ec == std::errc{} && ptr == end) {
+    return value;
+  }
+
+  return id;
+}
+
+static const Digit::PrimePlatform::Content::ContentItem*
+store_offer_consumable(const Digit::PrimePlatform::Content::BundleContent& content)
+{
+  for (const auto* list : {&content.static_(), &content.showcase(), &content.gifts()}) {
+    for (const auto& item : list->items()) {
+      if (item.type() == "consumable") {
+        return &item;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+// Emits one snapshot of the faction store's consumable offers (favor levels) whenever its content changes.
+static void store_offers(std::unique_ptr<std::string>&& bytes)
+{
+  using json = nlohmann::json;
+
+  static constexpr std::string_view category           = "factions";
+  static size_t                     store_offers_state = 0;
+  static std::mutex                 store_offers_mtx;
+
+  if (auto response = Digit::PrimePlatform::Content::Bundles(); response.ParseFromString(*bytes)) {
+
+    http::logging::trace("PROCESS", "store offers", STR_FORMAT("Processing {} store offers", response.bundles__size()));
+
+    // A store offers group carries whole categories; skip groups without the faction store.
+    struct Offer {
+      const Digit::PrimePlatform::Content::Bundle*      bundle;
+      const Digit::PrimePlatform::Content::ContentItem* consumable;
+    };
+    std::vector<Offer> bundles;
+    bool               has_category = false;
+    for (const auto& bundle : response.bundles_()) {
+      if (bundle.category() == category) {
+        has_category = true;
+        if (const auto* consumable = store_offer_consumable(bundle.content()); consumable != nullptr) {
+          bundles.push_back({&bundle, consumable});
+        }
+      }
+    }
+    if (!has_category) {
+      return;
+    }
+
+    // Sort by bundle id, then consumable id, so the snapshot (and therefore the de-dup hash) does not depend on server
+    // order.
+    std::ranges::sort(bundles, [](const Offer& a, const Offer& b) {
+      return std::pair{a.bundle->bundleid(), std::string_view{a.consumable->id()}}
+             < std::pair{b.bundle->bundleid(), std::string_view{b.consumable->id()}};
+    });
+
+    auto offers = json::array();
+    for (const auto& [bundle, consumable] : bundles) {
+      auto cost = json::array();
+      for (const auto& entry : bundle->cost()) {
+        for (const auto& resource : entry.cost_()) {
+          cost.push_back({{"rid", store_offer_id(resource.id())}, {"amount", store_offer_amount(resource)}});
+        }
+      }
+
+      // For faction_standing requirements the amount is a zero-based tier index.
+      auto req = json::array();
+      for (const auto& resource : bundle->requirements()) {
+        req.push_back({{"type", resource.type()},
+                       {"id", store_offer_id(resource.id())},
+                       {"amount", store_offer_amount(resource)}});
+      }
+
+      const auto& details = bundle->offerdetails();
+      offers.push_back({{"bid", bundle->bundleid()},
+                        {"cid", store_offer_id(consumable->id())},
+                        {"cost", cost},
+                        {"req", req},
+                        {"valid_count", details.validcount()},
+                        {"same_remaining_count", details.sameremainingcount()}});
+    }
+
+    json event = {{"type", SyncConfig::Type::StoreOffers}, {"category", category}, {"offers", offers}};
+
+    // Queue under the lock so the remembered snapshot and the queue order agree.
+    const auto       state_value = std::hash<json>{}(event);
+    std::scoped_lock lk(store_offers_mtx);
+    if (store_offers_state != state_value) {
+      store_offers_state = state_value;
+      workers::queue_data(SyncConfig::Type::StoreOffers, json::array({event}));
+    }
+  } else {
+    spdlog::error("Failed to parse store offers");
+  }
+}
+
 namespace json
 {
   static void battle_result_headers(const nlohmann::json& section)
@@ -2439,6 +2715,15 @@ static void HandleEntityGroup(EntityGroup* entity_group)
       if (sync_options.battlelogs) {
         submit_async(trackers::names::cache_player_names);
       }
+      if (sync_options.profile) {
+        // Skipped if the local profile is not ready; a later response retries.
+        auto* const local = processors::local_user_profile();
+        if (auto self = processors::local_user_id(local); !self.empty()) {
+          submit_async([self = std::move(self), level = local->Level](std::unique_ptr<std::string>&& bytes) {
+            processors::own_profile(std::move(bytes), self, level);
+          });
+        }
+      }
       break;
     case EntityGroup::Type::AllianceProfiles:
       if (sync_options.battlelogs) {
@@ -2493,11 +2778,11 @@ static void HandleEntityGroup(EntityGroup* entity_group)
       }
       break;
 
-    // case EntityGroup::Type::PlanetaryMapResponse:
-    //   if (sync_options.haven) {
-    //     submit_async(processors::planetary_map);
-    //   }
-    //   break;
+    case EntityGroup::Type::PlanetaryMapResponse:
+      if (sync_options.haven) {
+        submit_async(processors::planetary_map);
+      }
+      break;
 
     // inventory
     case EntityGroup::Type::PlayerInventories:
@@ -2527,7 +2812,7 @@ static void HandleEntityGroup(EntityGroup* entity_group)
 
     // officer
     case EntityGroup::Type::Officers:
-      if (sync_options.officer) {
+      if (sync_options.officers) {
         submit_async(processors::officers);
       }
       break;
@@ -2604,6 +2889,89 @@ static void HandleEntityGroup(EntityGroup* entity_group)
   }
 }
 
+// Platform responses (store offers among them) reach the same ProcessResultInternal detour as game server responses:
+// both model registries share one compiled method. Their entity group types use the Platform enum, so they must not
+// go through HandleEntityGroup.
+static bool IsPlatformResponse(ServiceResponse* service_response)
+{
+  static const Il2CppClass* platform_class = nullptr;
+
+  const auto* const response = reinterpret_cast<Il2CppObject*>(service_response);
+  if (response == nullptr || response->klass == nullptr) {
+    return false;
+  }
+  if (response->klass == platform_class) {
+    return true;
+  }
+
+  const char* const name_space = il2cpp_class_get_namespace(response->klass);
+  const char* const name       = il2cpp_class_get_name(response->klass);
+  if (name_space != nullptr && name != nullptr && std::strcmp(name_space, "Digit.Platform.Models") == 0
+      && std::strcmp(name, "ServiceResponse") == 0) {
+    platform_class = response->klass;
+    return true;
+  }
+
+  return false;
+}
+
+static void HandlePlatformResponse(ServiceResponse* service_response)
+{
+  auto* const        response       = reinterpret_cast<Il2CppObject*>(service_response);
+  static auto* const response_class = response->klass;
+  static auto        entity_groups  = IL2CppClassHelper{response_class}.GetProperty("EntityGroups");
+  if (response->klass != response_class) {
+    return;
+  }
+
+  auto* const groups = entity_groups.GetRaw<RepeatedField_EntityGroup>(response);
+  if (groups == nullptr) {
+    return;
+  }
+
+  for (int i = 0; i < groups->Count; ++i) {
+    auto* const group = reinterpret_cast<Il2CppObject*>(groups->get_Item(i));
+    if (group == nullptr || group->klass == nullptr) {
+      continue;
+    }
+
+    static auto* const group_class = group->klass;
+    static auto        group_type  = IL2CppClassHelper{group_class}.GetProperty("Type");
+    static auto        group_bytes = IL2CppClassHelper{group_class}.GetProperty("Group");
+    if (group->klass != group_class) {
+      continue;
+    }
+
+    const auto* const type = group_type.Get<int32_t>(group);
+    if (type == nullptr || *type != Digit::Platform::Models::EntityGroup::TYPE_STOREOFFERS) {
+      continue;
+    }
+
+    auto* const bytes = group_bytes.GetRaw<ByteString>(group);
+    if (bytes == nullptr || bytes->bytes == nullptr || bytes->Length <= 0) {
+      continue;
+    }
+
+    auto payload = std::make_unique<std::string>(reinterpret_cast<const char*>(bytes->bytes->m_Items),
+                                                 static_cast<size_t>(bytes->Length));
+    try {
+      std::thread([p = std::move(payload)]() mutable {
+        try {
+          processors::store_offers(std::move(p));
+        } catch (const std::exception& e) {
+          spdlog::error("Exception in HandlePlatformResponse: {}", e.what());
+        } catch (...) {
+          spdlog::error("Unknown exception in HandlePlatformResponse");
+        }
+      }).detach();
+    } catch (const std::exception& e) {
+      spdlog::error("Failed to spawn async task: {}", e.what());
+    } catch (...) {
+      spdlog::error("Failed to spawn async task: unknown exception");
+    }
+  }
+}
+
 namespace hooks
 {
 // IL2CPP value type: keep this parameter by value so following arguments retain their platform ABI positions.
@@ -2644,6 +3012,12 @@ static void* RtcParser_ParseFinalPayload(auto original, void* _this, CentrifugoI
 static void GameServerModelRegistry_ProcessResultInternal(auto original, void* _this, void* parsing_context,
                                                           ServiceResponse* service_response, MethodInfo* method)
 {
+  // Only the store offers option looks at Platform responses; everyone else keeps the unchanged path below.
+  if (Config::Get().sync_options.store_offers && IsPlatformResponse(service_response)) {
+    HandlePlatformResponse(service_response);
+    return original(_this, parsing_context, service_response, method);
+  }
+
   auto* const entity_groups = service_response->EntityGroups;
   for (int i = 0; i < entity_groups->Count; ++i) {
     auto* const entity_group = entity_groups->get_Item(i);
