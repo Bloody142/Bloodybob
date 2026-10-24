@@ -26,12 +26,14 @@ namespace SystemConfig
 
 namespace Control
 {
-  constexpr bool enable_experimental = false;
-  constexpr bool hotkeys_enabled     = true;
-  constexpr bool hotkeys_extended    = true;
-  constexpr bool use_scopely_hotkeys = false;
-  constexpr bool queue_enabled       = true;
-  constexpr auto select_timer        = 500;
+  constexpr bool enable_experimental             = false;
+  constexpr bool hotkeys_enabled                 = true;
+  constexpr bool hotkeys_extended                = true;
+  constexpr bool primary_requires_visible_target = false;
+  constexpr bool use_scopely_hotkeys             = false;
+  constexpr bool queue_enabled                   = true;
+  constexpr bool kirshara_fixes                  = true;
+  constexpr auto select_timer                    = 500;
 } // namespace Control
 
 namespace Graphics
@@ -47,6 +49,7 @@ namespace Graphics
   constexpr bool        free_resize                     = true;
   constexpr auto        keyboard_zoom_speed             = 350;
   constexpr auto        system_pan_momentum_falloff     = 0.8;
+  constexpr bool        disable_target_camera_lock = false;
   constexpr auto        system_pan_momentum             = 0.4;
   constexpr auto        system_zoom_preset_1            = 50;
   constexpr auto        system_zoom_preset_2            = 500;
@@ -60,6 +63,8 @@ namespace Graphics
   constexpr auto        ui_scale_viewer                 = 1.2;
   constexpr bool        use_presets_as_default          = true;
   constexpr auto        zoom                            = 5000;
+  constexpr auto        haven_zoom                      = 4000.0;
+  constexpr auto        interior_zoom_scale             = 2.0; // station-interior zoom-out multiplier; 1.0 = native
   constexpr auto        fr_scale                        = 2.0;
   constexpr bool        loader_enabled                  = true; // replace LoginSequence background
   constexpr bool        loader_transition               = true; // replace TVC/SlideShow backgrounds
@@ -77,6 +82,7 @@ namespace Patches
 {
   constexpr bool bufffixhooks               = true;
   constexpr bool chatpatches                = true;
+  constexpr bool chattitledisplayhooks      = true;
   constexpr bool freeresizehooks            = true;
   constexpr bool game_version               = true;
   constexpr bool hotkeyhooks                = true;
@@ -90,6 +96,8 @@ namespace Patches
   constexpr bool toastbannerhooks           = true;
   constexpr bool uiscalehooks               = true;
   constexpr bool zoomhooks                  = true;
+  constexpr bool havenzoomhooks             = true;
+  constexpr bool interiorzoomhooks          = true;
   constexpr bool miscpatches                = true;
   constexpr bool giftsbulkclaimhooks        = true;
   constexpr bool dailyfactionbulkclaimhooks = true;
@@ -98,13 +106,19 @@ namespace Patches
   constexpr bool loadingtiphooks            = true;
   constexpr bool doubleclickassignshiphooks = true;
   constexpr bool forbiddentechconfirmhooks  = true;
+  constexpr bool forbiddentechshipnamehooks = true;
   constexpr bool audioeventhooks            = true;
+  constexpr bool actionqueuerecoveryhooks   = true;
+  constexpr bool queueaddressguardhooks     = true;
+  constexpr bool thinqueueprotectionhooks   = true;
   constexpr bool artifactexchangehooks      = true;
   constexpr bool instantcargocounterhooks   = true;
   constexpr bool cargoformathooks           = true; // on by default: cargo number precision override
   constexpr bool officersorthooks           = true; // restore Below Deck Ability sort option
   constexpr bool pinnedshiphooks            = true; // pin configured ships to front of fleet dock sort
+  constexpr bool pinnedshipclicktoggle      = true; // SHIFT+click a fleet dock ship tile to pin/unpin it
   constexpr bool havenhistoryhooks          = true; // reverse Haven help history into newest-first order
+  constexpr bool revealconfirmhooks         = true; // auto-confirm the Excelsior Decloaking Deflector popup when enabled in [ui]
 } // namespace Patches
 
 namespace Shortcuts
@@ -225,18 +239,21 @@ namespace Sync
   constexpr const char* nextspocksclub_url = "https://next.spocks.club/sync/ingress/";
 
   constexpr bool        away_assignments   = true;
-  constexpr bool        battlelogs         = true;
+  constexpr bool        battlelogs         = false;
   constexpr bool        buffs              = true;
   constexpr bool        buildings          = true;
+  constexpr bool        haven              = true;
   constexpr bool        inventory          = true;
   constexpr bool        jobs               = true;
   constexpr bool        missions           = true;
   constexpr bool        officers           = true;
+  constexpr bool        profile            = false;
   constexpr const char* proxy              = "";
   constexpr bool        research           = true;
   constexpr bool        resources          = true;
   constexpr bool        ships              = true;
   constexpr bool        slots              = true;
+  constexpr bool        store_offers       = false;
   constexpr bool        tech               = true;
   constexpr bool        traits             = true;
   constexpr const char* token              = "";
@@ -251,11 +268,16 @@ namespace UI
 {
   constexpr bool        always_skip_reveal_sequence        = true;
   constexpr bool        arrow_keys_to_select_ship          = true;
+  constexpr bool        dock_syncmanagement                = true;
   constexpr bool        auto_confirm_discovery             = true;
   constexpr bool        auto_confirm_ft_upgrade            = false;
+  constexpr bool        forbidden_tech_ship_name           = true;
+  constexpr bool        auto_confirm_reveal_ability        = false;
+  constexpr bool        auto_confirm_alliance_contribution = false;
   constexpr bool        auto_open_bulk_claim_flyout        = false;
-  constexpr const char* daily_bulk_claim_factions          = "";
+  constexpr const char* daily_bulk_claim_factions          = "federation,klingon,romulan";
   constexpr bool        daily_bulk_claim_toggle_default_on = false;
+  constexpr bool        only_show_first_popup              = false;
   constexpr bool        disable_escape_exit                = true;
   // Maximum gap between Escape presses that opens the exit prompt.
   // 0 disables double-tap and preserves the existing blocked behavior.
@@ -267,6 +289,7 @@ namespace UI
   constexpr bool        disable_preview_recall      = false;
   constexpr bool        disable_toast_banners       = false;
   constexpr bool        disable_veil_chat           = false;
+  constexpr bool        show_player_title           = true;
   constexpr bool        disable_exchange_all        = false;
   constexpr bool        double_click_to_assign_ship = false;
   constexpr bool        focus_search                = true;
@@ -274,7 +297,6 @@ namespace UI
   constexpr bool        officer_sort                = true;
   constexpr bool        reverse_haven_history       = true;
   constexpr const char* disabled_banner_types       = "";
-  constexpr const char* hud_daily_goals             = "auto";
   constexpr const char* hud_field_training          = "auto";
   constexpr const char* hud_missions                = "auto";
   constexpr const char* hud_outposts                = "auto";
